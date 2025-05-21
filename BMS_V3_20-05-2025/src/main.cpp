@@ -75,6 +75,8 @@ unsigned long start_timer, current_time;  // Timer for SoC Estimation
 uint16_t avg_cellVoltage, avg_cellTemperature;  // Variable to hold average of 10 readings of cell voltage and temperature
 double minCV, maxCV;                            // Variables for min and max cell voltage
 double minCT, maxCT;                            // Variables for min and max cell temperature
+uint8_t minCTindex, maxCTindex; // Variables for indices of min and max cell temperature
+uint8_t minTempIC, maxTempIC; // Variables for indices of min and max cell temperature
 float soc = 100.0;                              // SoC Variable
 
 // Constants
@@ -316,25 +318,40 @@ void print_rxconfig(void) {
 
 void printStackVoltage() {
   const uint8_t printOrder[3][6] = {
-    { 18, 13, 12, 7, 6, 1 },
-    { 17, 14, 11, 8, 5, 2 },
-    { 16, 15, 10, 9, 4, 3 }
+      {18, 13, 12, 7, 6, 1},
+      {17, 14, 11, 8, 5, 2},
+      {16, 15, 10, 9, 4, 3}
   };
-
-  char buffer[20];  // Buffer for formatted output
 
   for (uint8_t row = 0; row < 3; row++) {
     for (uint8_t col = 0; col < 6; col++) {
-      uint8_t currentIc = printOrder[row][col] - 1;  // Convert 1-based index to 0-based
-      stack_voltage[currentIc] = BMS_IC[currentIc].stat.stat_codes[0] * 0.0001 * 20;
+      uint8_t ic = printOrder[row][col] - 1;
 
-      // Format string to ensure alignment (e.g., "S18:  120.8300")
-      sprintf(buffer, "S%-2d: %7.4f", printOrder[row][col], stack_voltage[currentIc]);
-      Serial.print(buffer);
+      if (ic >= TOTAL_IC) {
+        // Print stack number with alignment
+        Serial.print("S");
+        if (printOrder[row][col] < 10) Serial.print("0"); // pad single digit stack numbers
+        Serial.print(printOrder[row][col]);
+        Serial.print(": ");
 
-      if (col < 5) Serial.print(" | ");  // Column separator
+        // Error message
+        Serial.print("NotConn");
+      } else {
+        float voltage = BMS_IC[ic].stat.stat_codes[0] * 0.0001 * 20;
+
+        // Print stack number with alignment
+        Serial.print("S");
+        if (printOrder[row][col] < 10) Serial.print("0"); // pad single digit stack numbers
+        Serial.print(printOrder[row][col]);
+        Serial.print(": ");
+
+        // Voltage always between 0.0000 and 25.2000, so fixed width
+        Serial.print(voltage, 4);
+      }
+
+      if (col < 5) Serial.print(" | ");
     }
-    Serial.println();  // Move to the next row
+    Serial.println();
   }
 }
 
@@ -484,16 +501,15 @@ double minmaxCV() {
 }
 
 void minmaxCT() {
-  minCT = BMS_IC[0].aux.a_codes[0];
-  maxCT = minCT;
-  for (uint8_t currentIc; currentIc < TOTAL_IC; currentIc++) {
+  uint8_t currentIc;
+  
+  minCT = maxCT = tempCalc(0, 0);
+  for (currentIc = 0; currentIc < TOTAL_IC; currentIc++) {
     for (uint8_t temp = 0; temp < TEMPS; temp++) {
-      uint16_t temperature = BMS_IC[currentIc].aux.a_codes[temp];
-      minCT = (temperature < minCV) ? temperature : minCT;
-      maxCT = (temperature > maxCV) ? temperature : maxCT;
+      uint16_t temperature = tempCalc(currentIc, temp);
+      minCT = (temperature < minCT) ? temperature : minCT;
+      maxCT = (temperature > maxCT) ? temperature : maxCT;
     }
-    minCT = tempCalc(currentIc, minCT);
-    maxCT = tempCalc(currentIc, maxCT);
   }
 
   Serial.print("Maximum Cell Temperature: ");
@@ -503,6 +519,7 @@ void minmaxCT() {
   Serial.print(minCT);
   Serial.print(" C");
   Serial.println();
+  Serial.println(tempCalc(0, 3));
   Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
 }
 
