@@ -22,7 +22,7 @@
 
 /* User Defines */
 #define CCS 10                    // MCP chip select pin
-#define TOTAL_IC 1                // Total number of IC's/Total number of stacks
+#define TOTAL_IC 8                // Total number of IC's/Total number of stacks
 #define TOTAL_CELL 6              // Total number of cells per stack => Used for reading voltage values
 #define TEMPS 4                   // Total number of cells per stack => Used for reading temperature values
 #define UV 31000                  // Under voltage limit
@@ -61,7 +61,8 @@ uint8_t actual_index = 0;  // Iterator for actual data array
 uint8_t can_index = 0;     // Iterator for can data array
 
 // Booleans
-bool faultStatus = false;  // Fault status variable => Will trigger AMS Fault
+bool voltfaultStatus[TOTAL_IC][TOTAL_CELL];  // Fault status variable => Will trigger AMS Fault
+bool tempfaultStatus[TOTAL_IC][TEMPS];// Fault status variable => Will trigger AMS Fault
 
 // Counters
 uint8_t mainLoopCounter = 0;  // Counter variable to check whether main loop has run 10 times
@@ -75,8 +76,6 @@ unsigned long start_timer, current_time;  // Timer for SoC Estimation
 uint16_t avg_cellVoltage, avg_cellTemperature;  // Variable to hold average of 10 readings of cell voltage and temperature
 double minCV, maxCV;                            // Variables for min and max cell voltage
 double minCT, maxCT;                            // Variables for min and max cell temperature
-uint8_t minCTindex, maxCTindex; // Variables for indices of min and max cell temperature
-uint8_t minTempIC, maxTempIC; // Variables for indices of min and max cell temperature
 float soc = 100.0;                              // SoC Variable
 
 // Constants
@@ -141,9 +140,8 @@ void serialPrintHex(uint8_t);
 void serial_toByte(void);
 void printStackVoltage(void);
 void byte_toCAN(void);
-void print(uint8_t, uint8_t, uint16_t, bool);
-void printFault(uint8_t, uint8_t, uint16_t, bool);
-void faultCounter(uint32_t, uint16_t, uint16_t, uint16_t);
+void print(uint8_t, uint8_t, uint16_t, bool, bool);
+void faultCounter(uint16_t, uint16_t, bool, uint8_t, uint8_t);
 void BMSData(void);
 double tempCalc(uint8_t, uint8_t);
 void AvgBMSData(void);
@@ -158,9 +156,11 @@ void canSend(void);
 /* ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 //MCP_CAN CAN(CCS); // CAN object for MCP2515
 mcp2518fd CAN(CCS);  // CAN object for MCP2518FD
+int mainFaultStatus = 0;
 /* ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 void setup() {
   Serial.begin(115200); // Setting baud rate for Serial Monitor
+  while(!Serial);
   pinMode(16, OUTPUT);  // isoSPI LED 
   pinMode(10, OUTPUT);  //MCP CS
 
@@ -180,6 +180,7 @@ void setup() {
     check_error(error);
     print_rxconfig();
   }
+  digitalWrite(AMS_FAULT_SDC, LOW);
 }
 
 void loop() {
@@ -188,7 +189,7 @@ void loop() {
     measurementLoop();
     BMSData();
     faultCheck();
-    csFault_check();
+    //csFault_check();
     mainLoopCounter += 1;
     if (mainLoopCounter >= 10) {
       Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
@@ -200,6 +201,7 @@ void loop() {
       lvData();
       mainLoopCounter = 0;
     }
+    digitalWrite(AMS_FAULT_SDC, LOW);
     spi_enable(SPI_CLOCK_DIV16);
     prev_loopTime = current_loopTime;
   }
@@ -335,7 +337,7 @@ void printStackVoltage() {
         Serial.print(": ");
 
         // Error message
-        Serial.print("NotConn");
+        Serial.print("NotConn ");
       } else {
         float voltage = BMS_IC[ic].stat.stat_codes[0] * 0.0001 * 20;
 
@@ -374,7 +376,7 @@ void print_conv_time(uint32_t conv_time) {
 /* ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- */
 
 /* User defined functions */
-void print(uint8_t ic, uint8_t cell, uint16_t value, bool temp = false) {
+void print(uint8_t ic, uint8_t cell, uint16_t value, bool temp = false, bool fault = false) {
   Serial.print("S");
   Serial.print(ic + 1, DEC);
   Serial.print("C");
@@ -386,21 +388,28 @@ void print(uint8_t ic, uint8_t cell, uint16_t value, bool temp = false) {
   } else {
     Serial.print(value);
   }
+  if (fault){
+    Serial.print(" !FAULT! ");
+  }
   Serial.print(", ");
 }
 
-void printFault(uint8_t ic, uint8_t cell, uint16_t value, bool FAULT, bool temp = false) {
-  if (!FAULT) {
-    Serial.println("!FAULT!");
-    print(ic, cell, value, temp);
+void faultCounter(uint16_t value, bool isTemp, uint8_t ic, uint8_t cellno) {
+  if(!isTemp) {
+    if (value > OV || value < UV) {
+    volt_faultCounter[ic][cellno] += 1;
+    } 
+    else {
+    volt_faultCounter[ic][cellno] = 0;
+    }
   }
-}
-
-void faultCounter(uint32_t faultCounter, uint16_t value, uint16_t upperLimit, uint16_t lowerLimit) {
-  if (value > upperLimit || value < lowerLimit) {
-    faultCounter += 1;
-  } else {
-    faultCounter = 0;
+  else {
+    if (value > OT || value < UT) {
+    temps_faultCounter[ic][cellno] += 1;
+    } 
+  else {
+    temps_faultCounter[ic][cellno] = 0;
+    }
   }
 }
 
@@ -412,15 +421,47 @@ double tempCalc(uint8_t ic, uint8_t temp) {
 
 void BMSData() {
   for (uint8_t currentIc = 0; currentIc < TOTAL_IC; currentIc++) {
+    bool isTemp = false;
     for (uint8_t cell = 0; cell < TOTAL_CELL; cell++) {
       cellVoltage[currentIc][cell] += BMS_IC[currentIc].cells.c_codes[cell];
-      faultCounter(volt_faultCounter[currentIc][cell], BMS_IC[currentIc].cells.c_codes[cell], OV, UV);
+      faultCounter(BMS_IC[currentIc].cells.c_codes[cell], isTemp, currentIc, cell);
     }
+    isTemp = true;
     for (uint8_t temp = 0; temp < TEMPS; temp++) {
       cellTemperature[currentIc][temp] += tempCalc(currentIc, temp);
-      faultCounter(temps_faultCounter[currentIc][temp], BMS_IC[currentIc].aux.a_codes[temp], OT, UT);
+      faultCounter(tempCalc(currentIc, temp), isTemp, currentIc, temp);
     }
   }
+}
+
+void faultCheck() {
+  for (uint8_t currentIc = 0; currentIc < TOTAL_IC; currentIc++) {
+    bool isTemp = false;
+    for (uint8_t cell = 0; cell < TOTAL_CELL; cell++) {
+      if (volt_faultCounter[currentIc][cell] >= 10) {
+        voltfaultStatus[currentIc][cell] = true;
+        digitalWrite(AMS_FAULT_SDC, LOW);
+        volt_faultCounter[currentIc][cell] = 0;
+        digitalWrite(progLED1, HIGH);
+      } else {
+        voltfaultStatus[currentIc][cell] = false;
+        digitalWrite(progLED1, LOW);
+      }
+    }
+    isTemp = true;
+    for (uint8_t temp = 0; temp < TEMPS; temp++) {
+      if (temps_faultCounter[currentIc][temp] >= 10) {
+        tempfaultStatus[currentIc][temp] = true;
+        digitalWrite(AMS_FAULT_SDC, LOW);
+        temps_faultCounter[currentIc][temp] = 0;
+        digitalWrite(progLED2, HIGH);
+      } else {
+        tempfaultStatus[currentIc][temp] = false;
+        digitalWrite(progLED2, LOW);
+      }
+    }
+  }
+  Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
 }
 
 void AvgBMSData() {
@@ -429,7 +470,7 @@ void AvgBMSData() {
     Serial.println("Voltage Readings");
     for (uint8_t cell = 0; cell < TOTAL_CELL; cell++) {
       avg_cellVoltage = cellVoltage[currentIc][cell] / 10;
-      print(currentIc, cell, avg_cellVoltage, isTemp);
+      print(currentIc, cell, avg_cellVoltage, isTemp, voltfaultStatus[currentIc][cell]);
       cellVoltage[currentIc][cell] = 0;
     }
     Serial.println();
@@ -437,7 +478,7 @@ void AvgBMSData() {
     isTemp = true;
     for (uint8_t temp = 0; temp < TEMPS; temp++) {
       avg_cellTemperature = cellTemperature[currentIc][temp] / 10;
-      print(currentIc, temp, avg_cellTemperature, isTemp);
+      print(currentIc, temp, avg_cellTemperature, isTemp, tempfaultStatus[currentIc][temp]);
       cellTemperature[currentIc][temp] = 0;
     }
     Serial.println();
@@ -445,36 +486,6 @@ void AvgBMSData() {
   }
   Serial.println("Stack Voltage");
   printStackVoltage();
-  Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
-}
-
-void faultCheck() {
-  for (uint8_t currentIc = 0; currentIc < TOTAL_IC; currentIc++) {
-    bool isTemp = false;
-    for (uint8_t cell = 0; cell < TOTAL_CELL; cell++) {
-      if (volt_faultCounter[currentIc][cell] >= 10) {
-        faultStatus = false;
-        volt_faultCounter[currentIc][cell] = 0;
-        digitalWrite(progLED1, HIGH);
-      } else {
-        faultStatus = true;
-        digitalWrite(progLED1, LOW);
-      }
-      printFault(currentIc, cell, volt_faultCounter[currentIc][cell], faultStatus, isTemp);
-    }
-    isTemp = true;
-    for (uint8_t temp = 0; temp < TEMPS; temp++) {
-      if (temps_faultCounter[currentIc][temp] >= 10) {
-        faultStatus = false;
-        temps_faultCounter[currentIc][temp] = 0;
-        digitalWrite(progLED2, HIGH);
-      } else {
-        faultStatus = true;
-        digitalWrite(progLED2, LOW);
-      }
-      printFault(currentIc, temp, temps_faultCounter[currentIc][temp], faultStatus, isTemp);
-    }
-  }
   Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
 }
 
@@ -511,15 +522,12 @@ void minmaxCT() {
       maxCT = (temperature > maxCT) ? temperature : maxCT;
     }
   }
-
   Serial.print("Maximum Cell Temperature: ");
   Serial.print(maxCT);
   Serial.println(" C");
   Serial.print("Minimum Cell Temperature: ");
   Serial.print(minCT);
-  Serial.print(" C");
-  Serial.println();
-  Serial.println(tempCalc(0, 3));
+  Serial.println(" C");
   Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
 }
 
@@ -626,10 +634,10 @@ void csFault_check() {
   Serial.print(" Amps.");
   Serial.println();
   if (currentSensor < csFault_value) {
-    digitalWrite(AMS_FAULT_PIN, HIGH);
+    digitalWrite(AMS_FAULT_SDC, LOW);
     digitalWrite(progLED3, LOW);
   } else {
-    digitalWrite(AMS_FAULT_PIN, LOW);
+    digitalWrite(AMS_FAULT_SDC, HIGH);
     digitalWrite(progLED3, HIGH);
     Serial.println("Current sensor fault");
     Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
@@ -699,122 +707,3 @@ void lvData() {
   Serial.println();
   Serial.println("----------------------------------------------------------------------------------------------------------------------------------------------------------");
 }
-
-/*int8_t select_s_pin(void)
-{
-  int8_t read_s_pin=0;
-  
-  Serial.print(F("Please enter the Spin number: "));
-  read_s_pin = (int8_t)read_int();
-  Serial.println(read_s_pin);
-  return(read_s_pin);
-}*/
-/**
-void passiveBalancing()
-{
-  double minimumCell_voltage = minmaxCV();
-  for (uint8_t currentIc = 0; currentIc < TOTAL_IC; currentIc++)
-  {
-    for (uint8_t cell = 0; cell < TOTAL_CELL; cell++)
-    {
-      deltaVoltage[currentIc][cell]
-    }
-  }
-
-  /* Helper function to set GPIO bits 
-void LTC681x_set_cfgr_gpio(uint8_t nIC, cell_asic *ic, bool gpio[5])
-{
-	for (int i = 0; i < 5; i++)
-	{
-		if (gpio[i])
-			ic[nIC].config.tx_data[0] = ic[nIC].config.tx_data[0] | (0x01 << (i + 3));
-		else
-			ic[nIC].config.tx_data[0] = ic[nIC].config.tx_data[0] & (~(0x01 << (i + 3)));
-	}
-}
-
-/* Helper function to control discharge 
-void LTC681x_set_cfgr_dis(uint8_t nIC, cell_asic *ic, bool dcc[12])
-{
-	for (int i = 0; i < 8; i++)
-	{
-		if (dcc[i])
-			ic[nIC].config.tx_data[4] = ic[nIC].config.tx_data[4] | (0x01 << i);
-		else
-			ic[nIC].config.tx_data[4] = ic[nIC].config.tx_data[4] & (~(0x01 << i));
-	}
-	for (int i = 0; i < 4; i++)
-	{
-		if (dcc[i + 8])
-			ic[nIC].config.tx_data[5] = ic[nIC].config.tx_data[5] | (0x01 << i);
-		else
-			ic[nIC].config.tx_data[5] = ic[nIC].config.tx_data[5] & (~(0x01 << i));
-	}
-}
-  // Write read pwm configuration
-
-        //  PWM configuration data.
-        //  1)Set the corresponding DCC bit to one for pwm operation.
-        //  2)Set the DCTO bits to the required discharge time.
-        //  3)Choose the value to be configured depending on the
-        //   required duty cycle.
-        //  Refer to the data sheet.
-
-      wakeup_sleep(TOTAL_IC);
-      for (uint8_t current_ic = 0; current_ic<TOTAL_IC;current_ic++)
-      {
-        BMS_IC[current_ic].pwm.tx_data[0]= 0x88; // Duty cycle for S pin 2 and 1
-        BMS_IC[current_ic].pwm.tx_data[1]= 0x88; // Duty cycle for S pin 4 and 3
-        BMS_IC[current_ic].pwm.tx_data[2]= 0x88; // Duty cycle for S pin 6 and 5
-        BMS_IC[current_ic].pwm.tx_data[3]= 0x88; // Duty cycle for S pin 8 and 7
-        BMS_IC[current_ic].pwm.tx_data[4]= 0x88; // Duty cycle for S pin 10 and 9
-        BMS_IC[current_ic].pwm.tx_data[5]= 0x88; // Duty cycle for S pin 12 and 11
-      }
-      LTC6811_wrpwm(TOTAL_IC,0,BMS_IC);
-      print_wrpwm();
-
-      wakeup_idle(TOTAL_IC);
-      LTC6811_rdpwm(TOTAL_IC,0,BMS_IC);
-      print_rxpwm();
-      break;
-
-    // Write and read S Control Register Group
-      wakeup_sleep(TOTAL_IC);
-
-        //  S pin control.
-        //  1)Ensure that the pwm is set according to the requirement using the previous case.
-        //  2)Choose the value depending on the required number of pulses on S pin.
-        //  Refer to the data sheet.
-
-      for (uint8_t current_ic = 0; current_ic<TOTAL_IC;current_ic++)
-      {
-        BMS_IC[current_ic].sctrl.tx_data[0]=0xFF; // No. of high pulses on S pin 2 and 1
-        BMS_IC[current_ic].sctrl.tx_data[1]=0xFF; // No. of high pulses on S pin 4 and 3
-        BMS_IC[current_ic].sctrl.tx_data[2]=0xFF; // No. of high pulses on S pin 6 and 5
-        BMS_IC[current_ic].sctrl.tx_data[3]=0xFF; // No. of high pulses on S pin 8 and 7
-        BMS_IC[current_ic].sctrl.tx_data[4]=0xFF; // No. of high pulses on S pin 10 and 9
-        BMS_IC[current_ic].sctrl.tx_data[5]=0xFF; // No. of high pulses on S pin 12 and 11
-      }
-      LTC6811_wrsctrl(TOTAL_IC,streg,BMS_IC);
-      print_wrsctrl();
-
-      // Start S Control pulsing
-      wakeup_idle(TOTAL_IC);
-      LTC6811_stsctrl();
-
-      // Read S Control Register Group
-      wakeup_idle(TOTAL_IC);
-      error=LTC6811_rdsctrl(TOTAL_IC,streg,BMS_IC);
-      check_error(error);
-      print_rxsctrl();
-
-    // Clear S Control Register Group
-      wakeup_sleep(TOTAL_IC);
-      LTC6811_clrsctrl();
-
-      wakeup_idle(TOTAL_IC);
-      error=LTC6811_rdsctrl(TOTAL_IC,streg,BMS_IC); // Read S Control Register Group
-      check_error(error);
-      print_rxsctrl();
-      
-}**/
